@@ -29,6 +29,8 @@ import org.apache.flink.streaming.api.datastream.KeyedStream;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.sink.DiscardingSink;
+import org.apache.flink.streaming.api.graph.GlobalDataExchangeMode;
+import org.apache.flink.streaming.api.graph.StreamGraph;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperatorV2;
 import org.apache.flink.streaming.api.operators.BoundedMultiInput;
@@ -74,7 +76,7 @@ import static org.openjdk.jmh.annotations.Scope.Thread;
 /** An end to end test for sorted inputs for a keyed operator with bounded inputs. */
 public class SortingBoundedInputBenchmarks extends BenchmarkBase {
 
-    private static final int RECORDS_PER_INVOCATION = 1_500_000;
+    private static final int RECORDS_PER_INVOCATION = 3_000_000;
     private static final List<Integer> INDICES =
             IntStream.range(0, 10).boxed().collect(Collectors.toList());
 
@@ -108,27 +110,42 @@ public class SortingBoundedInputBenchmarks extends BenchmarkBase {
 
     @Benchmark
     @OperationsPerInvocation(value = RECORDS_PER_INVOCATION)
-    public void sortedOneInput(SortingInputContext context) throws Exception {
-        StreamExecutionEnvironment env = context.env;
-
-        DataStreamSource<Integer> elements =
-                env.fromParallelCollection(
-                        new InputGenerator(RECORDS_PER_INVOCATION), BasicTypeInfo.INT_TYPE_INFO);
-
-        SingleOutputStreamOperator<Long> counts =
-                elements.keyBy(element -> element)
-                        .transform(
-                                "Asserting operator",
-                                BasicTypeInfo.LONG_TYPE_INFO,
-                                new AssertingOperator());
-
-        counts.addSink(new DiscardingSink<>());
-        context.execute();
+    public void sortedTwoInputSlotSharingBlocking(SortingInputContext context) throws Exception {
+        runParameters(context, true, GlobalDataExchangeMode.ALL_EDGES_BLOCKING);
     }
 
     @Benchmark
     @OperationsPerInvocation(value = RECORDS_PER_INVOCATION)
-    public void sortedTwoInput(SortingInputContext context) throws Exception {
+    public void sortedTwoInputSlotSharingPipelined(SortingInputContext context) throws Exception {
+        runParameters(context, true, GlobalDataExchangeMode.ALL_EDGES_PIPELINED);
+    }
+
+    @Benchmark
+    @OperationsPerInvocation(value = RECORDS_PER_INVOCATION)
+    public void sortedTwoInputSlotSharingForwardPipelined(SortingInputContext context) throws Exception {
+        runParameters(context, true, GlobalDataExchangeMode.FORWARD_EDGES_PIPELINED);
+    }
+
+    @Benchmark
+    @OperationsPerInvocation(value = RECORDS_PER_INVOCATION)
+    public void sortedTwoInputNoSlotSharingBlocking(SortingInputContext context) throws Exception {
+        runParameters(context, false, GlobalDataExchangeMode.ALL_EDGES_BLOCKING);
+    }
+
+    @Benchmark
+    @OperationsPerInvocation(value = RECORDS_PER_INVOCATION)
+    public void sortedTwoInputNoSlotSharingPipelined(SortingInputContext context) throws Exception {
+        runParameters(context, false, GlobalDataExchangeMode.ALL_EDGES_PIPELINED);
+    }
+
+    @Benchmark
+    @OperationsPerInvocation(value = RECORDS_PER_INVOCATION)
+    public void sortedTwoInputNoSlotSharingForwardPipelined(SortingInputContext context) throws Exception {
+        runParameters(context, false, GlobalDataExchangeMode.FORWARD_EDGES_PIPELINED);
+    }
+
+    private static void runParameters(SortingInputContext context, boolean isSlotSharing, GlobalDataExchangeMode mode)
+        throws Exception {
         StreamExecutionEnvironment env = context.env;
 
         DataStreamSource<Integer> elements1 =
@@ -150,48 +167,10 @@ public class SortingBoundedInputBenchmarks extends BenchmarkBase {
                                 new AssertingTwoInputOperator());
 
         counts.addSink(new DiscardingSink<>());
-        context.execute();
-    }
-
-    @Benchmark
-    @OperationsPerInvocation(value = RECORDS_PER_INVOCATION)
-    public void sortedMultiInput(SortingInputContext context) throws Exception {
-        StreamExecutionEnvironment env = context.env;
-
-        KeyedStream<Integer, Object> elements1 =
-                env.fromParallelCollection(
-                                new InputGenerator(RECORDS_PER_INVOCATION / 3),
-                                BasicTypeInfo.INT_TYPE_INFO)
-                        .keyBy(el -> el);
-
-        KeyedStream<Integer, Object> elements2 =
-                env.fromParallelCollection(
-                                new InputGenerator(RECORDS_PER_INVOCATION / 3),
-                                BasicTypeInfo.INT_TYPE_INFO)
-                        .keyBy(el -> el);
-
-        KeyedStream<Integer, Object> elements3 =
-                env.fromParallelCollection(
-                                new InputGenerator(RECORDS_PER_INVOCATION / 3),
-                                BasicTypeInfo.INT_TYPE_INFO)
-                        .keyBy(el -> el);
-
-        KeyedMultipleInputTransformation<Long> assertingTransformation =
-                new KeyedMultipleInputTransformation<>(
-                        "Asserting operator",
-                        new AssertingThreeInputOperatorFactory(),
-                        BasicTypeInfo.LONG_TYPE_INFO,
-                        -1,
-                        BasicTypeInfo.INT_TYPE_INFO);
-        assertingTransformation.addInput(elements1.getTransformation(), elements1.getKeySelector());
-        assertingTransformation.addInput(elements2.getTransformation(), elements2.getKeySelector());
-        assertingTransformation.addInput(elements3.getTransformation(), elements3.getKeySelector());
-
-        env.addOperator(assertingTransformation);
-        DataStream<Long> counts = new DataStream<>(env, assertingTransformation);
-
-        counts.addSink(new DiscardingSink<>());
-        context.execute();
+        final StreamGraph g = env.getStreamGraph();
+        g.setAllVerticesInSameSlotSharingGroupByDefault(isSlotSharing);
+        g.setGlobalDataExchangeMode(mode);
+        env.execute(g);
     }
 
     private static final class ProcessedKeysOrderAsserter implements Serializable {
@@ -345,9 +324,6 @@ public class SortingBoundedInputBenchmarks extends BenchmarkBase {
 
         @Override
         public void setKeyContextElement(StreamRecord<Integer> record) {}
-
-        @Override
-        public void processStreamStatus(StreamStatus streamStatus) throws Exception {}
     }
 
     private static class InputGenerator extends SplittableIterator<Integer> {
